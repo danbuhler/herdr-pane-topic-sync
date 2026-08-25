@@ -85,7 +85,9 @@ special characters or marker prefixes in your labels. herdr exposes no
 provenance for a label, so ownership is inferred from three signals:
 
 1. **Never named.** A pane's label is `null` until something names it; a tab's
-   label defaults to its tab number (`"2"`). Either state is unclaimed, so the
+   label defaults to its 1-based switch position within its workspace (`"2"`),
+   which herdr keeps compact as tabs open, close, and move — it is not the
+   same as the tab's persistent `number`. Either state is unclaimed, so the
    plugin adopts it.
 2. **Still ours.** The live label is verbatim what the plugin last wrote (from
    the state file). If it differs, you changed it — hands off.
@@ -97,9 +99,13 @@ provenance for a label, so ownership is inferred from three signals:
 To hand a name back to the plugin, return it to its unclaimed state:
 
 ```sh
-herdr pane rename <pane_id> --clear   # panes: clears the label
-herdr tab rename <tab_id> 2           # tabs: rename to its tab number
+herdr pane rename <pane_id> --clear         # panes: clears the label
+herdr tab rename <tab_id> <switch-position> # tabs: rename to its current switch position
 ```
+
+Check a tab's current switch position with `herdr tab get <tab_id>` (the
+`label` field already shows it if the tab is still unclaimed) before renaming
+back to it.
 
 Set `respect_manual_names = false` for the old always-overwrite behavior.
 

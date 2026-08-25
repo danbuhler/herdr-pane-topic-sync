@@ -163,8 +163,15 @@ function loadState() {
 //
 // The virgin default differs by kind, per the herdr API:
 //   pane -> label is null (PaneInfo.label is nullable; unset until first rename)
-//   tab  -> label is its number as a string, e.g. "2" (TabInfo.label is
-//           non-nullable, so herdr seeds it from the tab number instead)
+//   tab  -> label is its 1-based switch position within the workspace, as a
+//           string (TabInfo.label is non-nullable, so herdr seeds it from
+//           that compact position instead). This is NOT the same as
+//           TabInfo.number, which is a persistent, non-reused id that keeps
+//           incrementing and drifts away from the compact position as tabs
+//           open, close, and move -- comparing against `number` here made
+//           every untouched tab look "manually renamed" once that drift
+//           happened, freezing tab sync (panes were unaffected: their virgin
+//           default is `null`, not a number).
 function isOwned(live, lastWritten, virgin, desired) {
   return live === virgin || live === desired || (lastWritten !== undefined && live === lastWritten);
 }
@@ -289,10 +296,12 @@ function main() {
         const m = info.get(p.pane_id);
         return m !== undefined && tab.label === labelFor(m);
       });
-      const owned = plausiblyOurs || isOwned(tab.label, state.tabs[tabId], String(tab.number), label);
+      const virgin = String(orderInWs.get(tabId));
+      const owned = plausiblyOurs || isOwned(tab.label, state.tabs[tabId], virgin, label);
       if (cfg.respect_manual_names && !owned) {
         // Renamed by hand. Drop our state entry too, so the way back under
-        // management is to rename it to its tab number (its virgin default).
+        // management is to rename it to its current compact switch position
+        // (its virgin default -- see the isOwned comment above).
         tabSkips++;
         continue;
       }
