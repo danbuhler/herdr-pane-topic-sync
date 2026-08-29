@@ -163,8 +163,10 @@ function loadState() {
 //
 // The virgin default differs by kind, per the herdr API:
 //   pane -> label is null (PaneInfo.label is nullable; unset until first rename)
-//   tab  -> label is its number as a string, e.g. "2" (TabInfo.label is
-//           non-nullable, so herdr seeds it from the tab number instead)
+//   tab  -> label is a number as a string, e.g. "2" (TabInfo.label is
+//           non-nullable, so herdr seeds it from the tab number instead; it is
+//           not updated when tabs are renumbered, so any all-digits label
+//           counts -- see the call site)
 function isOwned(live, lastWritten, virgin, desired) {
   return live === virgin || live === desired || (lastWritten !== undefined && live === lastWritten);
 }
@@ -289,7 +291,15 @@ function main() {
         const m = info.get(p.pane_id);
         return m !== undefined && tab.label === labelFor(m);
       });
-      const owned = plausiblyOurs || isOwned(tab.label, state.tabs[tabId], String(tab.number), label);
+      // A tab's label is seeded from its number at creation and does *not*
+      // follow renumbering, so a tab nobody ever named can end up carrying a
+      // stale number (born as tab 8, now tab 10). Comparing against the current
+      // number alone would read that as a human's name and freeze the tab
+      // forever. Any all-digits label is the virgin default -- consistent with
+      // the documented caveat that a numerically named tab is indistinguishable
+      // from an unnamed one.
+      const virgin = /^\d+$/.test(tab.label ?? "") ? tab.label : String(tab.number);
+      const owned = plausiblyOurs || isOwned(tab.label, state.tabs[tabId], virgin, label);
       if (cfg.respect_manual_names && !owned) {
         // Renamed by hand. Drop our state entry too, so the way back under
         // management is to rename it to its tab number (its virgin default).
