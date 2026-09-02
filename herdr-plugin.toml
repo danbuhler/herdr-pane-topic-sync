@@ -1,6 +1,6 @@
 id = "dan.pane-topic-sync"
 name = "Pane Topic Sync"
-version = "0.2.1"
+version = "0.2.2"
 min_herdr_version = "0.7.0"
 description = "Rename each agent pane to its live topic (terminal_title_stripped) and name each tab after its first pane's topic."
 platforms = ["macos", "linux", "windows"]

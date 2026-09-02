@@ -109,8 +109,9 @@ back to it.
 
 Set `respect_manual_names = false` for the old always-overwrite behavior.
 
-Caveat: renaming a tab to a plain number is indistinguishable from a tab nobody
-has named, so the plugin will claim it.
+Caveat: renaming a tab to exactly its current switch position is
+indistinguishable from a tab nobody has named, so the plugin will claim it.
+Other numbers are safe -- a tab you name `2024` stays yours.
 
 ## License
 
