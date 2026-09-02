@@ -24,8 +24,13 @@ Plain (non-agent) shell panes are left untouched.
   can't feed back into a loop.
 - Gates all writes through a state file (`$HERDR_PLUGIN_STATE_DIR/pane-topic-sync-state.json`),
   so `rename` is only called when a topic actually changed — no churn. The same
-  file records which labels are the plugin's own, so manual renames survive (see
+  file records the last few labels the plugin wrote for each pane and tab, so
+  manual renames survive (see
   [Manual renames are respected](#manual-renames-are-respected)).
+- herdr fires several subscribed events at once, so copies of the script overlap
+  routinely. Each run merges its histories with whatever reached the state file
+  since it started and swaps the file in atomically, so overlapping runs can't
+  clobber each other's bookkeeping.
 - "First pane" is resolved from `herdr pane layout` rect coordinates, sorted by
   `(y, x)`, so it's the visually top-left pane regardless of split order.
 
@@ -89,8 +94,10 @@ provenance for a label, so ownership is inferred from three signals:
    which herdr keeps compact as tabs open, close, and move — it is not the
    same as the tab's persistent `number`. Either state is unclaimed, so the
    plugin adopts it.
-2. **Still ours.** The live label is verbatim what the plugin last wrote (from
-   the state file). If it differs, you changed it — hands off.
+2. **Ours already.** The live label is one the plugin has written for that pane
+   or tab before — the state file keeps the last few, not just the most recent.
+   A label the agent has since moved past is still the plugin's own; anything
+   outside that history is yours, and it backs off.
 3. **Reads like ours.** The live label is exactly what the plugin *would* write
    right now, for any agent pane in that tab. This makes the plugin self-healing:
    delete the state file and it re-adopts everything it recognizes instead of
@@ -106,6 +113,10 @@ herdr tab rename <tab_id> <switch-position> # tabs: rename to its current switch
 Check a tab's current switch position with `herdr tab get <tab_id>` (the
 `label` field already shows it if the tab is still unclaimed) before renaming
 back to it.
+
+Entries survive a pane going quiet: if its agent exits, or agent detection
+drops, the plugin keeps the history and picks the pane back up when the agent
+returns on a new topic.
 
 Set `respect_manual_names = false` for the old always-overwrite behavior.
 

@@ -15,7 +15,7 @@
 // `isOwned` for how ownership is decided.
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -106,9 +106,38 @@ function json(args) {
   return out ? JSON.parse(out) : null;
 }
 
+// A pane or tab can close between our `list` and our `rename`. That is routine,
+// not fatal: report it and carry on, so one dead id cannot cost every pane after
+// it its update -- and cannot abort the run before we persist state.
+function renameSafely(args) {
+  try {
+    run(args);
+    return true;
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    return false;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Text helpers
 // ---------------------------------------------------------------------------
+
+// Status glyphs an agent may paint at the head of its terminal title, taken from
+// herdr's own agent-detection manifests (~/.local/state/herdr/agent-detection):
+//
+//   U+2800-28FF  braille spinner        claude, amp, codex, grok
+//   U+25CB-25D7  circle spinner ◐◑◒◓        claude, qwen
+//   U+2722-273F  asterisk/star family, incl. ✳  claude (idle), qwen (blocked)
+//   U+2713-2718  check / cross ✓             hermes (idle)
+//   U+23F0-23F8  ⏳ ⏵ ⏸                     hermes (working), claude transcript
+//   U+26A0       ⚠                       hermes (blocked)
+//   U+FE0E/FE0F  variation selector that may trail any of the above
+//
+// herdr normally hands us `terminal_title_stripped` with the glyph already gone,
+// so this is the belt to that braces: it keeps a raw title, a new agent herdr
+// does not yet strip for, or a future glyph out of the label.
+const STATUS_GLYPHS = /^(?:[>\u203a\u2713-\u2718\u23f0-\u23f8\u25cb-\u25d7\u26a0\u2722-\u273f\u2800-\u28ff][\ufe0e\ufe0f]?\s*)+/u;
 
 // Normalize a raw topic: drop control chars / spinner / stray markup, collapse
 // whitespace. Does NOT truncate -- truncation happens after formatting.
@@ -117,7 +146,7 @@ function normalize(value) {
     .replace(/[\x00-\x1f\x7f]/g, " ")               // control chars
     .replace(/^<command-name>.*?<\/command-name>\s*/i, "")
     .replace(/<[^>]+>/g, " ")                        // stray markup
-    .replace(/^[>›⠀-⣿]+\s*/, "")       // leading '>', '›', braille spinner
+    .replace(STATUS_GLYPHS, "")                      // leading '>', '›', spinner/status glyph
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -134,27 +163,79 @@ function applyFormat(fmt, tokens) {
 // ---------------------------------------------------------------------------
 // State + ownership
 //
-// We record the last label we wrote for each pane/tab. On the next run, if the
-// live label is no longer that string, a human renamed it in the meantime and
-// we stop managing it. State is keyed by pane_id / tab_id; those ids can be
-// recycled after a close, but a recycled pane/tab always comes back in its
-// "virgin" state below, which is adoptable anyway -- so a stale entry is inert.
+// We record the labels we have written for each pane/tab -- a short history,
+// newest first, not just the most recent one. A live label still in that history
+// is ours; anything else is a name a human typed.
+//
+// A history rather than one string, because our bookkeeping legitimately drifts
+// from the screen in ways that are nobody's fault:
+//
+//   * copies of this script run concurrently -- herdr fires workspace.focused,
+//     tab.focused and pane.focused together -- so a slower run can persist a
+//     view of the world taken before a faster one renamed;
+//   * a pane stops being an agent pane for a while (Claude exits, agent
+//     detection drops, the title goes empty), so we cannot recompute its label
+//     that run, and used to drop its entry;
+//   * a `herdr` call fails mid-run and we never reach `saveState`.
+//
+// With one string per id, each of those left our own label unrecognizable on the
+// next run: it was filed as a manual rename and the pane froze at a stale topic
+// permanently. Histories are additive, so concurrent runs merge rather than
+// clobber, and a label we wrote three topics ago is still ours.
+//
+// State is keyed by pane_id / tab_id and pruned to ids still in the session.
+// Those ids can be recycled after a close, but a recycled pane/tab always comes
+// back in its "virgin" state below, which is adoptable anyway.
 // ---------------------------------------------------------------------------
+
+const STATE_VERSION = 2;
+const HISTORY_LIMIT = 5; // labels remembered per pane/tab
 
 function loadState() {
   try {
     const s = JSON.parse(readFileSync(statePath, "utf8"));
-    return { panes: s.panes || {}, tabs: s.tabs || {} };
+    return { panes: readSection(s.panes), tabs: readSection(s.tabs) };
   } catch {
     return { panes: {}, tabs: {} };
   }
+}
+
+// v1 stored one label string per id; v2 stores { seen: [newest, ...older] }.
+// Read both, so upgrading in place keeps ownership of what is already on screen.
+function readSection(section) {
+  const out = {};
+  for (const [id, entry] of Object.entries(section || {})) {
+    const raw = typeof entry === "string" ? [entry] : Array.isArray(entry?.seen) ? entry.seen : [];
+    const seen = raw.filter((label) => typeof label === "string").slice(0, HISTORY_LIMIT);
+    if (seen.length) out[id] = { seen };
+  }
+  return out;
+}
+
+// Newest first, no duplicates, capped.
+function remember(entry, label) {
+  const seen = [label, ...(entry?.seen ?? []).filter((prev) => prev !== label)];
+  return { seen: seen.slice(0, HISTORY_LIMIT) };
+}
+
+// Keep what we knew about ids that are still here -- including panes we skip
+// this run because they are not agent panes right now. Dropping those is what
+// froze a pane whose agent had merely exited and come back. Ids absent from the
+// live list are gone (or were created after our snapshot, in which case the next
+// run re-adopts them via `desired`), so they are pruned and state stays bounded.
+function carryForward(section, liveIds) {
+  const out = {};
+  for (const [id, entry] of Object.entries(section)) {
+    if (liveIds.has(id)) out[id] = entry;
+  }
+  return out;
 }
 
 // A label is ours to write if any of these hold; anything else is a human's
 // name and we leave it alone:
 //
 //   1. it has never been named by anyone -- its `virgin` default
-//   2. its live label is still verbatim what we last wrote
+//   2. its live label is one we have written before (the state history)
 //   3. it already reads exactly what we are about to write (`desired`)
 //
 // (3) is what makes this self-healing: lose the state file (reinstall, new
@@ -172,13 +253,36 @@ function loadState() {
 //           every untouched tab look "manually renamed" once that drift
 //           happened, freezing tab sync (panes were unaffected: their virgin
 //           default is `null`, not a number).
-function isOwned(live, lastWritten, virgin, desired) {
-  return live === virgin || live === desired || (lastWritten !== undefined && live === lastWritten);
+function isOwned(live, entry, virgin, desired) {
+  return live === virgin || live === desired || (entry?.seen?.includes(live) ?? false);
 }
 
 function saveState(state) {
   mkdirSync(dirname(statePath), { recursive: true });
-  writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+  // Overlapping runs would otherwise clobber each other with a whole-file
+  // overwrite: merge with whatever reached disk since we loaded, then swap the
+  // file in atomically so no reader sees a half-written state. Histories union,
+  // so the result does not depend on which run finishes last -- no lock needed.
+  const onDisk = loadState();
+  const merged = {
+    version: STATE_VERSION,
+    panes: mergeSection(state.panes, onDisk.panes),
+    tabs: mergeSection(state.tabs, onDisk.tabs),
+  };
+  const tmp = `${statePath}.${process.pid}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(merged, null, 2)}\n`);
+  renameSync(tmp, statePath);
+}
+
+// Union of our histories with the ones on disk, ours first. Keyed on our ids, so
+// entries we pruned this run stay pruned.
+function mergeSection(ours, onDisk) {
+  const out = {};
+  for (const [id, entry] of Object.entries(ours)) {
+    const seen = [...new Set([...entry.seen, ...(onDisk[id]?.seen ?? [])])];
+    out[id] = { seen: seen.slice(0, HISTORY_LIMIT) };
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -222,104 +326,113 @@ function main() {
   let tabWrites = 0;
   let paneSkips = 0;
   let tabSkips = 0;
+  let failures = 0;
   const state = loadState();
-  const nextPanes = {};
-  const nextTabs = {};
+  // Start from what we already knew about ids that are still here, so a pane we
+  // do not touch this run keeps its history instead of losing it.
+  const nextPanes = carryForward(state.panes, new Set(panes.map((p) => p.pane_id)));
+  const nextTabs = carryForward(state.tabs, new Set(tabs.map((t) => t.tab_id)));
 
-  // 1) Panes.
-  if (cfg.sync_panes) {
-    for (const p of panes) {
-      const meta = info.get(p.pane_id);
-      if (!meta) continue;
-      const label = cap(
-        applyFormat(cfg.pane_format, { topic: meta.topic, agent: meta.agent, workspace: wsLabel(p.workspace_id) }),
-        cfg.max_label_length,
-      );
-      // `pane list` omits `label` entirely when unset; normalize that to null.
-      const live = p.label ?? null;
-      if (cfg.respect_manual_names && !isOwned(live, state.panes[p.pane_id], null, label)) {
-        // Renamed by hand. Drop our state entry too, so the only way back under
-        // management is `herdr pane rename <id> --clear` (-> null -> virgin).
-        paneSkips++;
-        continue;
-      }
-      nextPanes[p.pane_id] = label;
-      if (live !== label) {
-        run(["pane", "rename", p.pane_id, label]);
-        paneWrites++;
-      }
-    }
-  } else {
-    // Preserve prior state so toggling sync_panes back on doesn't re-churn.
-    Object.assign(nextPanes, state.panes);
-  }
-
-  // 2) Tabs. Tab switch number = 1-based position within its workspace.
-  const orderInWs = new Map();
-  const wsCounters = new Map();
-  for (const t of tabs) {
-    const c = (wsCounters.get(t.workspace_id) || 0) + 1;
-    wsCounters.set(t.workspace_id, c);
-    orderInWs.set(t.tab_id, c);
-  }
-
-  if (cfg.sync_tabs) {
-    const tabById = new Map(tabs.map((t) => [t.tab_id, t]));
-    for (const [tabId, tabPanes] of byTab) {
-      const tab = tabById.get(tabId);
-      if (!tab) continue;
-      const srcId = sourcePaneId(tabPanes, cfg.tab_source);
-      // Chosen pane's topic; fall back to first agent pane in list order.
-      let meta = info.get(srcId);
-      if (!meta) {
-        for (const p of tabPanes) {
-          if (info.has(p.pane_id)) { meta = info.get(p.pane_id); break; }
+  try {
+    // 1) Panes.
+    if (cfg.sync_panes) {
+      for (const p of panes) {
+        const meta = info.get(p.pane_id);
+        if (!meta) continue; // not an agent pane right now; its history stays put
+        const label = cap(
+          applyFormat(cfg.pane_format, { topic: meta.topic, agent: meta.agent, workspace: wsLabel(p.workspace_id) }),
+          cfg.max_label_length,
+        );
+        // `pane list` omits `label` entirely when unset; normalize that to null.
+        const live = p.label ?? null;
+        if (cfg.respect_manual_names && !isOwned(live, state.panes[p.pane_id], null, label)) {
+          // Renamed by hand. We keep the history entry -- ownership needs the live
+          // label to match it, so we stay off this pane until you hand it back
+          // with `herdr pane rename <id> --clear` (-> null -> virgin).
+          paneSkips++;
+          continue;
         }
-      }
-      if (!meta) continue;
-      const wsId = tabPanes[0].workspace_id;
-      const labelFor = (m) => cap(
-        applyFormat(cfg.tab_format, {
-          topic: m.topic,
-          agent: m.agent,
-          n: orderInWs.get(tabId) ?? "",
-          workspace: wsLabel(wsId),
-        }),
-        cfg.max_label_length,
-      );
-      const label = labelFor(meta);
-      // Which pane names a tab can change between runs -- `tab_source =
-      // "active"` follows your focus, and panes come and go. So for the
-      // self-heal check, count a label we'd write for *any* agent pane in this
-      // tab as ours, not just the one currently chosen.
-      const plausiblyOurs = tabPanes.some((p) => {
-        const m = info.get(p.pane_id);
-        return m !== undefined && tab.label === labelFor(m);
-      });
-      const virgin = String(orderInWs.get(tabId));
-      const owned = plausiblyOurs || isOwned(tab.label, state.tabs[tabId], virgin, label);
-      if (cfg.respect_manual_names && !owned) {
-        // Renamed by hand. Drop our state entry too, so the way back under
-        // management is to rename it to its current compact switch position
-        // (its virgin default -- see the isOwned comment above).
-        tabSkips++;
-        continue;
-      }
-      nextTabs[tabId] = label;
-      if (tab.label !== label) {
-        run(["tab", "rename", tabId, label]);
-        tabWrites++;
+        if (live !== label) {
+          if (!renameSafely(["pane", "rename", p.pane_id, label])) {
+            failures++;
+            continue; // never claim a label that did not land
+          }
+          paneWrites++;
+        }
+        nextPanes[p.pane_id] = remember(state.panes[p.pane_id], label);
       }
     }
-  } else {
-    // Preserve prior state so toggling sync_tabs back on doesn't re-churn.
-    Object.assign(nextTabs, state.tabs);
-  }
 
-  saveState({ panes: nextPanes, tabs: nextTabs });
+    // 2) Tabs. Tab switch number = 1-based position within its workspace.
+    const orderInWs = new Map();
+    const wsCounters = new Map();
+    for (const t of tabs) {
+      const c = (wsCounters.get(t.workspace_id) || 0) + 1;
+      wsCounters.set(t.workspace_id, c);
+      orderInWs.set(t.tab_id, c);
+    }
+
+    if (cfg.sync_tabs) {
+      const tabById = new Map(tabs.map((t) => [t.tab_id, t]));
+      for (const [tabId, tabPanes] of byTab) {
+        const tab = tabById.get(tabId);
+        if (!tab) continue;
+        const srcId = sourcePaneId(tabPanes, cfg.tab_source);
+        // Chosen pane's topic; fall back to first agent pane in list order.
+        let meta = info.get(srcId);
+        if (!meta) {
+          for (const p of tabPanes) {
+            if (info.has(p.pane_id)) { meta = info.get(p.pane_id); break; }
+          }
+        }
+        if (!meta) continue;
+        const wsId = tabPanes[0].workspace_id;
+        const labelFor = (m) => cap(
+          applyFormat(cfg.tab_format, {
+            topic: m.topic,
+            agent: m.agent,
+            n: orderInWs.get(tabId) ?? "",
+            workspace: wsLabel(wsId),
+          }),
+          cfg.max_label_length,
+        );
+        const label = labelFor(meta);
+        // Which pane names a tab can change between runs -- `tab_source =
+        // "active"` follows your focus, and panes come and go. So for the
+        // self-heal check, count a label we'd write for *any* agent pane in this
+        // tab as ours, not just the one currently chosen.
+        const plausiblyOurs = tabPanes.some((p) => {
+          const m = info.get(p.pane_id);
+          return m !== undefined && tab.label === labelFor(m);
+        });
+        const virgin = String(orderInWs.get(tabId));
+        const owned = plausiblyOurs || isOwned(tab.label, state.tabs[tabId], virgin, label);
+        if (cfg.respect_manual_names && !owned) {
+          // Renamed by hand. As with panes we keep the history entry; the way back
+          // under management is to rename the tab to its current compact switch
+          // position (its virgin default -- see the isOwned comment above).
+          tabSkips++;
+          continue;
+        }
+        if (tab.label !== label) {
+          if (!renameSafely(["tab", "rename", tabId, label])) {
+            failures++;
+            continue;
+          }
+          tabWrites++;
+        }
+        nextTabs[tabId] = remember(state.tabs[tabId], label);
+      }
+    }
+  } finally {
+    // Persist even if something above threw: a partial history is still
+    // ours, and losing it is what used to freeze a pane at a stale topic.
+    saveState({ panes: nextPanes, tabs: nextTabs });
+  }
   const skipped = cfg.respect_manual_names ? `, kept ${paneSkips} pane / ${tabSkips} tab manual name(s)` : "";
+  const failed = failures ? `, ${failures} rename(s) failed` : "";
   console.log(
-    `synced: ${paneWrites} pane rename(s), ${tabWrites} tab rename(s)${skipped} ` +
+    `synced: ${paneWrites} pane rename(s), ${tabWrites} tab rename(s)${skipped}${failed} ` +
     `[panes=${cfg.sync_panes} tabs=${cfg.sync_tabs} source=${cfg.tab_source} manual=${cfg.respect_manual_names}]`,
   );
 }
