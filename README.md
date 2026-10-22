@@ -12,14 +12,23 @@ On every relevant herdr event it:
 2. **Renames each tab** to the topic of its **first pane** (top-left, reading
    order). If the first pane is a plain shell, the first *agent* pane's topic is
    used instead, so a tab is never named after a shell prompt.
+3. **Clears the pane label and tab title it wrote when agents exit** — panes
+   fall back to the shell, and a tab with no agent panes left returns to its
+   switch-position name, so neither keeps the last topic (disable with
+   `clear_on_agent_exit = false`).
 
-Plain (non-agent) shell panes are left untouched.
+Shell panes that never hosted an agent are never named.
 
 ## How it works
 
 - Subscribes to `pane.*` / `tab.focused` / `workspace.focused` events (see
   `herdr-plugin.toml`). The key trigger is `pane.agent_status_changed`, which
   fires when an agent flips idle↔working — i.e. when it sets a fresh topic.
+- Agent exit also flips the pane back to a shell. When a pane has no topic, the
+  plugin clears the label it wrote once `herdr pane process-info` reports a
+  shell in the foreground. That check keeps a transient agent-detection blip
+  from wiping a live topic off the border. Tabs with no agent pane left are
+  renamed back to their switch-position label, since tabs have no `--clear`.
 - Deliberately does **not** subscribe to `*.renamed` events, so its own renames
   can't feed back into a loop.
 - Gates all writes through a state file (`$HERDR_PLUGIN_STATE_DIR/pane-topic-sync-state.json`),
@@ -79,6 +88,7 @@ documented set. Summary:
 | `tab_format` | `"{topic}"` | Template; tokens `{topic}` `{agent}` `{workspace}` `{n}` (tab switch number). |
 | `pane_format` | `"{topic}"` | Template; tokens `{topic}` `{agent}` `{workspace}`. |
 | `respect_manual_names` | `true` | Never overwrite a pane/tab you renamed yourself. See below. |
+| `clear_on_agent_exit` | `true` | Clear a pane label or tab title the plugin wrote when agents exit. |
 
 Examples: `tab_format = "{n}· {topic}"` keeps the tab switch number;
 `pane_format = "{agent}: {topic}"` prefixes the agent name.
@@ -114,9 +124,9 @@ Check a tab's current switch position with `herdr tab get <tab_id>` (the
 `label` field already shows it if the tab is still unclaimed) before renaming
 back to it.
 
-Entries survive a pane going quiet: if its agent exits, or agent detection
-drops, the plugin keeps the history and picks the pane back up when the agent
-returns on a new topic.
+Entries survive a pane or tab going quiet: if its agent exits, the plugin
+clears the pane label or restores the tab's switch-position label, but keeps
+the history and picks it back up when the agent returns on a new topic.
 
 Set `respect_manual_names = false` for the old always-overwrite behavior.
 

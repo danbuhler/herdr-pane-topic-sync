@@ -38,6 +38,7 @@ const DEFAULTS = {
   tab_format: "{topic}",        // tokens: {topic} {agent} {n} {workspace}
   pane_format: "{topic}",       // tokens: {topic} {agent} {workspace}
   respect_manual_names: true,   // never overwrite a pane/tab you renamed yourself
+  clear_on_agent_exit: true,    // clear a pane label we wrote when its agent exits
 };
 
 // Minimal flat-TOML reader: key = value, one per line. Values may be quoted
@@ -81,6 +82,7 @@ function loadConfig() {
   cfg.sync_panes = cfg.sync_panes !== false;
   cfg.sync_tabs = cfg.sync_tabs !== false;
   cfg.respect_manual_names = cfg.respect_manual_names !== false;
+  cfg.clear_on_agent_exit = cfg.clear_on_agent_exit !== false;
   if (cfg.tab_source !== "active") cfg.tab_source = "first";
   const n = parseInt(cfg.max_label_length, 10);
   cfg.max_label_length = Number.isFinite(n) && n > 0 ? n : DEFAULTS.max_label_length;
@@ -115,6 +117,24 @@ function renameSafely(args) {
     return true;
   } catch (err) {
     console.error(err instanceof Error ? err.message : String(err));
+    return false;
+  }
+}
+
+const SHELL_PROCESS_NAMES = new Set([
+  "bash", "zsh", "fish", "sh", "dash", "ksh", "mksh", "nu", "pwsh", "powershell",
+  "cmd", "cmd.exe",
+]);
+
+// A pane can momentarily lose agent detection while the agent still runs.
+// Only clear its label when the shell itself has the foreground, so a
+// detection blip does not wipe the topic off the border.
+function shellIsForeground(paneId) {
+  try {
+    const info = json(["pane", "process-info", "--pane", paneId])?.result?.process_info;
+    const procs = info?.foreground_processes ?? [];
+    return procs.length > 0 && procs.every((proc) => SHELL_PROCESS_NAMES.has(proc.name));
+  } catch {
     return false;
   }
 }
@@ -323,7 +343,9 @@ function main() {
   };
 
   let paneWrites = 0;
+  let paneClears = 0;
   let tabWrites = 0;
+  let tabClears = 0;
   let paneSkips = 0;
   let tabSkips = 0;
   let failures = 0;
@@ -338,7 +360,21 @@ function main() {
     if (cfg.sync_panes) {
       for (const p of panes) {
         const meta = info.get(p.pane_id);
-        if (!meta) continue; // not an agent pane right now; its history stays put
+        if (!meta) {
+          // Agent exited (or detection is off): clear a label we wrote so the
+          // border falls back to the shell instead of keeping the last topic.
+          const live = p.label ?? null;
+          if (
+            cfg.clear_on_agent_exit &&
+            live !== null &&
+            (state.panes[p.pane_id]?.seen?.includes(live) ?? false) &&
+            shellIsForeground(p.pane_id) &&
+            renameSafely(["pane", "rename", p.pane_id, "--clear"])
+          ) {
+            paneClears++;
+          }
+          continue; // its history stays put so a returning agent is recognized
+        }
         const label = cap(
           applyFormat(cfg.pane_format, { topic: meta.topic, agent: meta.agent, workspace: wsLabel(p.workspace_id) }),
           cfg.max_label_length,
@@ -385,7 +421,21 @@ function main() {
             if (info.has(p.pane_id)) { meta = info.get(p.pane_id); break; }
           }
         }
-        if (!meta) continue;
+        if (!meta) {
+          // No agent pane left in this tab: restore the switch-position label
+          // we started from, but only if the current label is one we wrote.
+          // Tabs have no `--clear`, so the virgin name is the way back.
+          const virgin = String(orderInWs.get(tabId));
+          if (
+            cfg.clear_on_agent_exit &&
+            tab.label !== virgin &&
+            (state.tabs[tabId]?.seen?.includes(tab.label) ?? false) &&
+            renameSafely(["tab", "rename", tabId, virgin])
+          ) {
+            tabClears++;
+          }
+          continue;
+        }
         const wsId = tabPanes[0].workspace_id;
         const labelFor = (m) => cap(
           applyFormat(cfg.tab_format, {
@@ -432,8 +482,8 @@ function main() {
   const skipped = cfg.respect_manual_names ? `, kept ${paneSkips} pane / ${tabSkips} tab manual name(s)` : "";
   const failed = failures ? `, ${failures} rename(s) failed` : "";
   console.log(
-    `synced: ${paneWrites} pane rename(s), ${tabWrites} tab rename(s)${skipped}${failed} ` +
-    `[panes=${cfg.sync_panes} tabs=${cfg.sync_tabs} source=${cfg.tab_source} manual=${cfg.respect_manual_names}]`,
+    `synced: ${paneWrites} pane rename(s), ${paneClears} pane clear(s), ${tabWrites} tab rename(s), ${tabClears} tab clear(s)${skipped}${failed} ` +
+    `[panes=${cfg.sync_panes} tabs=${cfg.sync_tabs} source=${cfg.tab_source} manual=${cfg.respect_manual_names} clear=${cfg.clear_on_agent_exit}]`,
   );
 }
 

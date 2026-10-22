@@ -19,6 +19,11 @@ sync_tabs  = true
 # event.
 respect_manual_names = true
 
+# Clear the label the plugin wrote when an agent exits and the shell returns.
+# For tabs, restore the switch-position label once no agent pane remains.
+# Set false to keep the last topic on the border after the agent exits.
+clear_on_agent_exit = true
+
 # Which pane's topic names a multi-pane tab:
 #   "first"  = the top-left pane (reading order)
 #   "active" = the pane you last focused *within that tab* (herdr tracks this
