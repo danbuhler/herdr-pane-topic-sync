@@ -345,6 +345,7 @@ function main() {
   let paneWrites = 0;
   let paneClears = 0;
   let tabWrites = 0;
+  let tabClears = 0;
   let paneSkips = 0;
   let tabSkips = 0;
   let failures = 0;
@@ -420,7 +421,21 @@ function main() {
             if (info.has(p.pane_id)) { meta = info.get(p.pane_id); break; }
           }
         }
-        if (!meta) continue;
+        if (!meta) {
+          // No agent pane left in this tab: restore the switch-position label
+          // we started from, but only if the current label is one we wrote.
+          // Tabs have no `--clear`, so the virgin name is the way back.
+          const virgin = String(orderInWs.get(tabId));
+          if (
+            cfg.clear_on_agent_exit &&
+            tab.label !== virgin &&
+            (state.tabs[tabId]?.seen?.includes(tab.label) ?? false) &&
+            renameSafely(["tab", "rename", tabId, virgin])
+          ) {
+            tabClears++;
+          }
+          continue;
+        }
         const wsId = tabPanes[0].workspace_id;
         const labelFor = (m) => cap(
           applyFormat(cfg.tab_format, {
@@ -467,7 +482,7 @@ function main() {
   const skipped = cfg.respect_manual_names ? `, kept ${paneSkips} pane / ${tabSkips} tab manual name(s)` : "";
   const failed = failures ? `, ${failures} rename(s) failed` : "";
   console.log(
-    `synced: ${paneWrites} pane rename(s), ${paneClears} pane clear(s), ${tabWrites} tab rename(s)${skipped}${failed} ` +
+    `synced: ${paneWrites} pane rename(s), ${paneClears} pane clear(s), ${tabWrites} tab rename(s), ${tabClears} tab clear(s)${skipped}${failed} ` +
     `[panes=${cfg.sync_panes} tabs=${cfg.sync_tabs} source=${cfg.tab_source} manual=${cfg.respect_manual_names} clear=${cfg.clear_on_agent_exit}]`,
   );
 }

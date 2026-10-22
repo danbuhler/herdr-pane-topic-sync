@@ -20,6 +20,7 @@ sync_tabs  = true
 respect_manual_names = true
 
 # Clear the label the plugin wrote when an agent exits and the shell returns.
+# For tabs, restore the switch-position label once no agent pane remains.
 # Set false to keep the last topic on the border after the agent exits.
 clear_on_agent_exit = true
 
